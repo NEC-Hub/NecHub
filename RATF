@@ -1,4 +1,4 @@
---// Roll Anime to Fight! - by NEC
+--// Roll Anime to Fight! - by NeColman
 --// Obsidian UI
 
 if not game:IsLoaded() then
@@ -26,6 +26,8 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
 local LocalPlayer = Players.LocalPlayer
 
 local Remotes = ReplicatedStorage:WaitForChild("Remotes")
@@ -34,6 +36,9 @@ local RollRemote = CharRemotes:WaitForChild("Roll")
 local BuyRemote = CharRemotes:WaitForChild("Buy")
 local UpgradeRemote = Remotes:WaitForChild("Upgrade")
 local SpinRemote = Remotes:WaitForChild("SpinWheel"):WaitForChild("Spin")
+local JoinTowerRemote = Remotes:WaitForChild("JoinTower")
+local ItemUseRemote = Remotes:WaitForChild("Items"):WaitForChild("Use")
+local CodesRedeemRemote = Remotes:WaitForChild("Codes"):WaitForChild("Redeem")
 
 -- Modules & Sub-Remotes
 local DataServiceClient = require(ReplicatedStorage.Data.DataService).client
@@ -49,6 +54,27 @@ local BPGetQuestData = BattlepassQuestModule:WaitForChild("GetQuestData")
 
 local FactionModule = ReplicatedStorage.Modules.Shared:WaitForChild("Faction")
 local FactionUpdate = FactionModule:WaitForChild("FactionUpdate")
+
+local FightRemote = Remotes:WaitForChild("Fight"):WaitForChild("Start")
+
+------------------------------------------------------
+-- Auto-Execute on Rejoin / Teleport Helper
+------------------------------------------------------
+local LOADSTRING_SCRIPT = 'loadstring(game:HttpGet("https://raw.githubusercontent.com/NEC-Hub/NecHub/main/RATF"))()'
+local function queueRejoinExecution()
+	local queue_fn = syn and syn.queue_on_teleport or queue_on_teleport or (fluxus and fluxus.queue_on_teleport)
+	if queue_fn then
+		pcall(function()
+			queue_fn(LOADSTRING_SCRIPT)
+		end)
+	end
+end
+
+LocalPlayer.OnTeleport:Connect(function()
+	if State and State.autoExecuteOnRejoin then
+		queueRejoinExecution()
+	end
+end)
 
 ------------------------------------------------------
 -- Plot & Roll Prompt Helper
@@ -98,7 +124,6 @@ table.sort(AllCharacterNames)
 
 local AllMutations = {
 	"Normal",
-	"No Mutation",
 	"Astronaut",
 	"Cursed",
 	"Demon",
@@ -132,7 +157,6 @@ local function getOwnedUnitNames()
 		end
 	end
 
-	-- Check Backpack
 	local backpack = LocalPlayer:FindFirstChild("Backpack")
 	if backpack then
 		for _, item in backpack:GetChildren() do
@@ -142,7 +166,6 @@ local function getOwnedUnitNames()
 		end
 	end
 
-	-- Check Character
 	local char = LocalPlayer.Character
 	if char then
 		for _, item in char:GetChildren() do
@@ -152,7 +175,6 @@ local function getOwnedUnitNames()
 		end
 	end
 
-	-- Check Placed Units on Plot
 	local plot = getMyPlot()
 	if plot then
 		local chars = plot:FindFirstChild("Characters")
@@ -186,14 +208,31 @@ local State = {
 	maxLevelUp = 7,
 	isFusing = false,
 	
+	-- Combat & Tower
+	autoFight = false,
+	autoStopWave = false,
+	targetStopWave = 50,
+	autoJoinTower = false,
+	
+	-- Potions
+	autoLuckPotion = false,
+	autoPotionOnMutationEvents = false,
+	
+	-- Events
 	autoSpinWheel = false,
 	isSpinning = false,
-	
 	autoClaimBattlepass = false,
 	autoClaimQuests = false,
-	
 	autoClaimFactionQuests = false,
 	
+	-- Webhook
+	webhookEnabled = false,
+	webhookUrl = "",
+	
+	-- Misc
+	antiAfk = true,
+	autoExecuteOnRejoin = true,
+	autoSaveConfig = true,
 	fpsBoost = false,
 	removeOtherBases = false,
 }
@@ -203,7 +242,6 @@ local rollConnection = nil
 local spinConnection = nil
 local factionConnection = nil
 local originalBaseParents = {}
-
 local latestFactionQuests = nil
 
 ------------------------------------------------------
@@ -236,6 +274,24 @@ local function getPlayerGold()
 	return tonumber(gold) or 0
 end
 
+local function getCurrentWave()
+	local waveAttr = tonumber(LocalPlayer:GetAttribute("FightWave"))
+	if waveAttr then return waveAttr end
+
+	local mainUI = LocalPlayer.PlayerGui:FindFirstChild("MainUI")
+	local textLabel = mainUI and mainUI:FindFirstChild("UITop") and mainUI.UITop:FindFirstChild("Top") and mainUI.UITop.Top:FindFirstChild("Main") and mainUI.UITop.Top.Main:FindFirstChild("Wave") and mainUI.UITop.Top.Main.Wave:FindFirstChild("Frame") and mainUI.UITop.Top.Main.Wave.Frame:FindFirstChild("TextLabel")
+	if textLabel and textLabel.Text then
+		local parsed = tonumber(textLabel.Text:match("%d+"))
+		if parsed then return parsed end
+	end
+	return 1
+end
+
+local function isFightRunning()
+	local runningAttr = LocalPlayer:GetAttribute("FightRunning")
+	return runningAttr == true or runningAttr == "true"
+end
+
 local function getBattlepassLevel(exp)
 	local totalExp = math.max(0, math.floor(tonumber(exp) or 0))
 	local maxLevel = tonumber(BattlepassReward.Config.MaxLevel) or 30
@@ -254,6 +310,72 @@ local function getBattlepassLevel(exp)
 	end
 
 	return currentLevel, maxLevel
+end
+
+------------------------------------------------------
+-- Discord Webhook Notification System
+------------------------------------------------------
+local function sendDiscordWebhook(embedData)
+	local url = Options.WebhookUrl and Options.WebhookUrl.Value or State.webhookUrl
+	if not url or url == "" or not string.find(url, "discord.com/api/webhooks") then
+		return
+	end
+
+	local http_req = request or http_request or (syn and syn.request) or (http and http.request)
+	if not http_req then return end
+
+	task.spawn(function()
+		pcall(function()
+			local payload = {
+				username = "Roll Anime Notifier",
+				avatar_url = "https://www.roblox.com/headshot-thumbnail/image?userId=" .. tostring(LocalPlayer.UserId) .. "&width=150&height=150&format=png",
+				embeds = { embedData }
+			}
+			http_req({
+				Url = url,
+				Method = "POST",
+				Headers = { ["Content-Type"] = "application/json" },
+				Body = HttpService:JSONEncode(payload)
+			})
+		end)
+	end)
+end
+
+local RarityColors = {
+	Common = 10066329,
+	Rare = 3447003,
+	Epic = 10181046,
+	Legendary = 15844367,
+	Mythic = 15158332,
+	Secret = 1752220,
+	God = 16766720,
+}
+
+local function notifyCharacterObtained(actionType, charData, rollId, slot)
+	if not (Toggles.WebhookEnabled and Toggles.WebhookEnabled.Value) then return end
+
+	local dName = charData.DisplayName or charData.Name or "Unknown"
+	local rarity = charData.Rarity or "Common"
+	local mutation = charData.Mutation or "None"
+	local price = charData.Price and CharacterAdditional.FormatNumber2(tonumber(charData.Price) or 0) or "Free"
+	local color = RarityColors[rarity] or 3447003
+
+	local embed = {
+		title = (actionType == "Auto Buy" and "🛒 Character Purchased!" or "🎲 Rare Character Rolled!"),
+		color = color,
+		fields = {
+			{ name = "Character", value = "**" .. dName .. "**", inline = true },
+			{ name = "Rarity", value = rarity, inline = true },
+			{ name = "Mutation", value = (mutation == "None" and "Normal" or "**" .. mutation .. "**"), inline = true },
+			{ name = "Slot", value = "Slot #" .. tostring(slot or 1), inline = true },
+			{ name = "Price", value = "$" .. tostring(price), inline = true },
+			{ name = "Player", value = LocalPlayer.Name, inline = true },
+		},
+		footer = { text = "Roll Anime to Fight! • " .. os.date("%X") },
+		timestamp = DateTime.now():ToIsoDate()
+	}
+
+	sendDiscordWebhook(embed)
 end
 
 ------------------------------------------------------
@@ -287,21 +409,20 @@ local function shouldBuyCharacter(charData)
 
 	local charMutation = charData.Mutation
 	if charMutation == nil or charMutation == "" or charMutation == "Normal" then
-		return selectedMutations["Normal"] == true or selectedMutations["No Mutation"] == true
+		return selectedMutations["Normal"] == true
 	else
 		return selectedMutations[charMutation] == true
 	end
 end
 
 local function setupHooks()
-	-- Roll Hook
+	-- Roll & Webhook Hook
 	if rollConnection then
 		rollConnection:Disconnect()
 		rollConnection = nil
 	end
 
 	rollConnection = RollRemote.OnClientEvent:Connect(function(player, plot, charResults, _, rollId)
-		if not State.autoBuy then return end
 		if player ~= LocalPlayer then return end
 		if not charResults or not rollId then return end
 
@@ -309,11 +430,18 @@ local function setupHooks()
 		task.wait(0.5)
 
 		for slotIndex, charData in charResults do
-			if shouldBuyCharacter(charData) then
+			if State.autoBuy and shouldBuyCharacter(charData) then
 				pcall(function()
 					BuyRemote:FireServer(rollId, slotIndex)
+					notifyCharacterObtained("Auto Buy", charData, rollId, slotIndex)
 				end)
 				task.wait(0.15)
+			else
+				local rarity = charData.Rarity or "Common"
+				local hasMutation = charData.Mutation ~= nil and charData.Mutation ~= "" and charData.Mutation ~= "Normal"
+				if rarity == "Mythic" or rarity == "Secret" or rarity == "God" or hasMutation then
+					notifyCharacterObtained("Rare Roll", charData, rollId, slotIndex)
+				end
 			end
 		end
 
@@ -417,17 +545,14 @@ local function triggerPromptWithTeleport(prompt, hrp, originalPos)
 	local targetCF = getPromptWorldCFrame(prompt)
 	if not targetCF or not hrp then return end
 
-	-- Teleport into prompt activation zone
 	hrp.CFrame = targetCF
 	task.wait(0.15)
 
-	-- Fire proximity prompt
 	pcall(function()
 		fireproximityprompt(prompt)
 	end)
 	task.wait(0.25)
 
-	-- Return to original position
 	if originalPos then
 		hrp.CFrame = originalPos
 		task.wait(0.1)
@@ -461,7 +586,6 @@ local function performFullAutoFusion()
 		local maxLvlCap = tonumber(Options.MaxLevelUp and Options.MaxLevelUp.Value) or 7
 		local originalPos = hrp.CFrame
 
-		-- Map current placed characters by slot
 		local occupiedSlots = {}
 		local placedList = {}
 		for _, c in charactersFolder:GetChildren() do
@@ -479,7 +603,6 @@ local function performFullAutoFusion()
 			end
 		end
 
-		-- Find all available placement prompts by slot number
 		local slotPrompts = {}
 		for _, slotModel in placementFolder:GetChildren() do
 			local slotNum = tonumber(slotModel.Name:match("%d+"))
@@ -521,7 +644,7 @@ local function performFullAutoFusion()
 			end
 		end
 
-		-- STEP 2: Cross-Slot Fusion (If 2 slots hold duplicate units of identical level)
+		-- STEP 2: Cross-Slot Fusion
 		for i = 1, #placedList do
 			for j = i + 1, #placedList do
 				local p1 = placedList[i]
@@ -530,11 +653,9 @@ local function performFullAutoFusion()
 					local prompt2 = slotPrompts[p2.slot]
 					local prompt1 = slotPrompts[p1.slot]
 					if prompt2 and prompt1 then
-						-- Pick up p2 into bag
 						unequipAllTools(humanoid)
 						triggerPromptWithTeleport(prompt2, hrp, nil)
 
-						-- Find the picked up tool and merge it into p1
 						allTools = getAllInventoryTools()
 						for _, tool in allTools do
 							local toolName = tool.Name
@@ -563,7 +684,6 @@ local function performFullAutoFusion()
 		end
 
 		if emptySlotPrompt then
-			-- Group inventory tools by (name, level, mutation)
 			local toolGroups = {}
 			for _, tool in allTools do
 				local toolName = tool.Name
@@ -576,18 +696,15 @@ local function performFullAutoFusion()
 				end
 			end
 
-			-- If we have at least 2 identical tools in bag, place one and fuse the other
 			for _, group in toolGroups do
 				if #group >= 2 then
 					local tool1 = group[1]
 					local tool2 = group[2]
 
-					-- Equip tool1 and place onto empty slot
 					humanoid:EquipTool(tool1)
 					task.wait(0.2)
 					triggerPromptWithTeleport(emptySlotPrompt, hrp, nil)
 
-					-- Equip tool2 and merge onto the newly placed unit
 					humanoid:EquipTool(tool2)
 					task.wait(0.2)
 					triggerPromptWithTeleport(emptySlotPrompt, hrp, originalPos)
@@ -595,7 +712,6 @@ local function performFullAutoFusion()
 				end
 			end
 
-			-- If only 1 unit and empty slot, place it to prepare for future rolls
 			for _, group in toolGroups do
 				if #group >= 1 then
 					local tool1 = group[1]
@@ -615,7 +731,7 @@ end
 -- UI Creation
 ------------------------------------------------------
 local Window = Library:CreateWindow({
-	Title = "NEC",
+	Title = "NeColman",
 	Footer = "Roll Anime to Fight!",
 	Icon = 95816097006870,
 	NotifySide = "Right",
@@ -624,6 +740,7 @@ local Window = Library:CreateWindow({
 
 local Tabs = {
 	Main = Window:AddTab("Main", "swords"),
+	Combat = Window:AddTab("Combat", "shield"),
 	Upgrades = Window:AddTab("Upgrades", "trending-up"),
 	Events = Window:AddTab("Events", "award"),
 	Misc = Window:AddTab("Misc", "gauge"),
@@ -684,7 +801,54 @@ BuyGroup:AddDropdown("BuyMutations", {
 })
 
 ------------------------------------------------------
--- Upgrades Tab
+-- Combat Tab (Fight, Waves, Tower)
+------------------------------------------------------
+local FightGroup = Tabs.Combat:AddLeftGroupbox("Auto Fight", "swords")
+
+FightGroup:AddToggle("autoFight", {
+	Text = "Auto Fight / Waves",
+	Default = false,
+	Tooltip = "Automatically starts and continues arena fight waves.",
+	Callback = function(value)
+		State.autoFight = value
+	end,
+})
+
+FightGroup:AddToggle("autoStopWave", {
+	Text = "Auto Stop at Target Wave",
+	Default = false,
+	Tooltip = "Automatically stops fighting once you reach the specified target wave.",
+	Callback = function(value)
+		State.autoStopWave = value
+	end,
+})
+
+FightGroup:AddSlider("TargetStopWave", {
+	Text = "Stop Wave Target",
+	Default = 50,
+	Min = 5,
+	Max = 500,
+	Rounding = 0,
+	Compact = false,
+	Tooltip = "Target wave number to stop fighting at.",
+	Callback = function(value)
+		State.targetStopWave = value
+	end,
+})
+
+local TowerGroup = Tabs.Combat:AddRightGroupbox("Infinite Tower", "tower-control")
+
+TowerGroup:AddToggle("autoJoinTower", {
+	Text = "Auto Join Tower",
+	Default = false,
+	Tooltip = "Continuously queues and auto-joins the Infinite Tower for gem farming.",
+	Callback = function(value)
+		State.autoJoinTower = value
+	end,
+})
+
+------------------------------------------------------
+-- Upgrades Tab (Stats, Level Up, Potions)
 ------------------------------------------------------
 local UpgradeGroup = Tabs.Upgrades:AddLeftGroupbox("Auto Upgrade", "trending-up")
 
@@ -792,6 +956,27 @@ FusionGroup:AddSlider("MaxLevelUp", {
 	Tooltip = "Target level cap for automated fusion (Game max is 7).",
 })
 
+-- Potions Groupbox
+local PotionGroup = Tabs.Upgrades:AddRightGroupbox("Auto Potions", "flask-conical")
+
+PotionGroup:AddToggle("autoLuckPotion", {
+	Text = "Auto Luck Potion",
+	Default = false,
+	Tooltip = "Automatically consumes Luck Potions from your inventory when boost runs out.",
+	Callback = function(value)
+		State.autoLuckPotion = value
+	end,
+})
+
+PotionGroup:AddToggle("autoPotionOnMutationEvents", {
+	Text = "Auto Use on Mutation Events",
+	Default = false,
+	Tooltip = "Automatically pops Luck/Mutation potions as soon as a server Mutation Event starts.",
+	Callback = function(value)
+		State.autoPotionOnMutationEvents = value
+	end,
+})
+
 -- Auto refresh dropdown when inventory changes
 local function setupInventoryListeners()
 	local backpack = LocalPlayer:WaitForChild("Backpack")
@@ -879,9 +1064,115 @@ FactionGroup:AddToggle("autoClaimFactionQuests", {
 })
 
 ------------------------------------------------------
--- Misc / Performance Tab
+-- Misc Tab (Codes, Webhook, Performance, Anti-AFK)
 ------------------------------------------------------
-local PerfGroup = Tabs.Misc:AddLeftGroupbox("Performance", "gauge")
+local WebhookGroup = Tabs.Misc:AddLeftGroupbox("Discord Webhook", "send")
+
+WebhookGroup:AddToggle("WebhookEnabled", {
+	Text = "Enable Webhook Notifier",
+	Default = false,
+	Tooltip = "Sends Discord webhook embed notifications when buying or rolling rare/mutated units.",
+	Callback = function(value)
+		State.webhookEnabled = value
+	end,
+})
+
+WebhookGroup:AddInput("WebhookUrl", {
+	Default = "",
+	Text = "Webhook URL",
+	Placeholder = "https://discord.com/api/webhooks/...",
+	Tooltip = "Paste your Discord Channel Webhook URL here.",
+	Finished = true,
+	Callback = function(value)
+		State.webhookUrl = value
+	end,
+})
+
+WebhookGroup:AddButton({
+	Text = "Test Webhook",
+	Func = function()
+		sendDiscordWebhook({
+			title = "🔔 Test Notification",
+			description = "Roll Anime to Fight! webhook is connected and working!",
+			color = 65280,
+			footer = { text = "NEC Hub" },
+			timestamp = DateTime.now():ToIsoDate()
+		})
+		Library:Notify({ Title = "Webhook", Description = "Test message sent!", Time = 2 })
+	end,
+})
+
+local CodesGroup = Tabs.Misc:AddRightGroupbox("Promo Codes", "gift")
+
+local KnownCodes = {
+	"RELEASE",
+	"ROLL",
+	"ANIME",
+	"FIGHT",
+	"TOWER",
+	"FACTION",
+	"UPDATE1",
+	"10KLIKES",
+	"5KLIKES",
+	"SORRYFORSHUTDOWN",
+	"LUCK",
+	"GEMS",
+}
+
+CodesGroup:AddButton({
+	Text = "Redeem All Promo Codes",
+	Func = function()
+		task.spawn(function()
+			for _, code in KnownCodes do
+				pcall(function()
+					CodesRedeemRemote:InvokeServer(code)
+				end)
+				task.wait(0.3)
+			end
+			Library:Notify({
+				Title = "Codes",
+				Description = string.format("Tried redeeming %d codes!", #KnownCodes),
+				Time = 3
+			})
+		end)
+	end,
+	Tooltip = "Attempts to redeem all known active codes for free spins, gems, and items.",
+})
+
+CodesGroup:AddInput("CustomCode", {
+	Default = "",
+	Text = "Custom Code",
+	Placeholder = "Enter code...",
+	Finished = true,
+	Callback = function(value)
+		if value and value ~= "" then
+			pcall(function()
+				CodesRedeemRemote:InvokeServer(value)
+				Library:Notify({ Title = "Code", Description = "Submitted code: " .. value, Time = 2 })
+			end)
+		end
+	end,
+})
+
+local PerfGroup = Tabs.Misc:AddLeftGroupbox("Performance & AFK", "gauge")
+
+PerfGroup:AddToggle("antiAfk", {
+	Text = "Anti-AFK (24/7 Farming)",
+	Default = true,
+	Tooltip = "Prevents Roblox from kicking you after 20 minutes of idle time.",
+	Callback = function(value)
+		State.antiAfk = value
+	end,
+})
+
+PerfGroup:AddToggle("autoExecuteOnRejoin", {
+	Text = "Auto Execute on Rejoin",
+	Default = true,
+	Tooltip = "Automatically loads this script when rejoining or teleporting between games/towers.",
+	Callback = function(value)
+		State.autoExecuteOnRejoin = value
+	end,
+})
 
 PerfGroup:AddToggle("fpsBoost", {
 	Text = "FPS Boost",
@@ -943,7 +1234,7 @@ PerfGroup:AddToggle("removeOtherBases", {
 })
 
 ------------------------------------------------------
--- UI Settings Tab
+-- UI Settings Tab (Config Auto-Save & Theme)
 ------------------------------------------------------
 local MenuGroup = Tabs["UI Settings"]:AddLeftGroupbox("Menu", "wrench")
 
@@ -985,6 +1276,16 @@ Library.ToggleKeybind = Options.MenuKeybind
 -- Background Loops
 ------------------------------------------------------
 local function startLoops()
+	-- Anti-AFK Hook
+	LocalPlayer.Idled:Connect(function()
+		if State.antiAfk then
+			pcall(function()
+				VirtualUser:CaptureController()
+				VirtualUser:ClickButton2(Vector2.zero)
+			end)
+		end
+	end)
+
 	-- Auto Roll Loop
 	stopThread("autoRoll")
 	activeThreads["autoRoll"] = task.spawn(function()
@@ -1006,6 +1307,88 @@ local function startLoops()
 				task.wait(delay)
 			else
 				task.wait(0.2)
+			end
+		end
+	end)
+
+	-- Auto Combat & Wave Loop (with Auto Stop Wave support)
+	stopThread("autoCombat")
+	activeThreads["autoCombat"] = task.spawn(function()
+		while true do
+			if Library.Unloaded then break end
+			if State.autoFight then
+				pcall(function()
+					local currentWave = getCurrentWave()
+					local targetWave = tonumber(Options.TargetStopWave and Options.TargetStopWave.Value) or State.targetStopWave
+					local running = isFightRunning()
+
+					if State.autoStopWave and currentWave >= targetWave then
+						-- If reached or passed target wave, stop the fight if currently active
+						if running then
+							FightRemote:FireServer("Stop")
+							task.wait(0.5)
+						end
+					else
+						-- Start next fight if not currently in a fight
+						if not running then
+							FightRemote:FireServer("Start")
+							task.wait(0.5)
+						end
+					end
+				end)
+				task.wait(1)
+			else
+				task.wait(1)
+			end
+		end
+	end)
+
+	-- Auto Join Tower Loop
+	stopThread("autoTower")
+	activeThreads["autoTower"] = task.spawn(function()
+		while true do
+			if Library.Unloaded then break end
+			if State.autoJoinTower then
+				pcall(function()
+					JoinTowerRemote:FireServer()
+				end)
+				task.wait(3)
+			else
+				task.wait(2)
+			end
+		end
+	end)
+
+	-- Auto Potions & Mutation Events Loop
+	stopThread("autoPotions")
+	activeThreads["autoPotions"] = task.spawn(function()
+		while true do
+			if Library.Unloaded then break end
+			if State.autoLuckPotion or State.autoPotionOnMutationEvents then
+				pcall(function()
+					local mutationActive = false
+					for _, mutName in AllMutations do
+						if mutName ~= "Normal" then
+							if workspace:GetAttribute(mutName) ~= nil then
+								mutationActive = true
+								break
+							end
+						end
+					end
+
+					if (State.autoPotionOnMutationEvents and mutationActive) or State.autoLuckPotion then
+						local hasLuckBuff = LocalPlayer:GetAttribute("Luck2x") == "true" or LocalPlayer:GetAttribute("SuperLuck") == "true" or LocalPlayer:GetAttribute("UltraLuck") == "true"
+						if not hasLuckBuff then
+							ItemUseRemote:FireServer("Luck Potion")
+							ItemUseRemote:FireServer("Super Luck Potion")
+							ItemUseRemote:FireServer("Ultra Luck Potion")
+							ItemUseRemote:FireServer("Mutation Potion")
+						end
+					end
+				end)
+				task.wait(3)
+			else
+				task.wait(1.5)
 			end
 		end
 	end)
@@ -1091,7 +1474,6 @@ local function startLoops()
 					local exp = tonumber(bpData.Exp) or 0
 					local currentLvl, maxLvl = getBattlepassLevel(exp)
 
-					-- Claim Battlepass Tier Rewards
 					if State.autoClaimBattlepass then
 						local claimedFree = (bpData.Claimed and bpData.Claimed.Free) or {}
 						local claimedPrem = (bpData.Claimed and bpData.Claimed.Premium) or {}
@@ -1109,7 +1491,6 @@ local function startLoops()
 						end
 					end
 
-					-- Claim Battlepass Quests
 					if State.autoClaimQuests then
 						local questData = BPGetQuestData:InvokeServer()
 						if questData then
@@ -1162,21 +1543,32 @@ local function startLoops()
 		end
 	end)
 
-	-- Fast Live UI Displays Refresher
+	-- Fast Live UI Displays Refresher & Auto-Config Saver
 	stopThread("uiRefresher")
 	activeThreads["uiRefresher"] = task.spawn(function()
+		local saveCounter = 0
 		while true do
 			if Library.Unloaded then break end
 			updateUpgradeLevelsDisplay()
 			updateSpinDisplay()
 			updateBPDisplay()
+
+			-- Periodic auto-save config (every 5 seconds)
+			saveCounter += 1
+			if State.autoSaveConfig and saveCounter >= 10 then
+				saveCounter = 0
+				pcall(function()
+					SaveManager:Save("default")
+				end)
+			end
+
 			task.wait(0.5)
 		end
 	end)
 end
 
 ------------------------------------------------------
--- Addons
+-- SaveManager & ThemeManager Addons
 ------------------------------------------------------
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
@@ -1188,7 +1580,26 @@ SaveManager:SetFolder("NEC/roll-anime")
 
 SaveManager:BuildConfigSection(Tabs["UI Settings"])
 ThemeManager:ApplyToTab(Tabs["UI Settings"])
-SaveManager:LoadAutoloadConfig()
+
+-- Add Auto-Save Toggle into UI Settings
+local ConfigGroup = Tabs["UI Settings"]:AddRightGroupbox("Auto Save", "save")
+ConfigGroup:AddToggle("AutoSaveConfig", {
+	Text = "Auto Save Config",
+	Default = true,
+	Tooltip = "Automatically saves your configuration to 'default' and auto-loads it on execute.",
+	Callback = function(value)
+		State.autoSaveConfig = value
+	end,
+})
+
+-- Load default config on startup
+pcall(function()
+	if isfile and isfile("NEC/roll-anime/settings/default.json") then
+		SaveManager:Load("default")
+	else
+		SaveManager:LoadAutoloadConfig()
+	end
+end)
 
 ------------------------------------------------------
 -- Start
@@ -1200,6 +1611,13 @@ startLoops()
 -- Cleanup
 ------------------------------------------------------
 Library:OnUnload(function()
+	-- Save config on unload
+	if State.autoSaveConfig then
+		pcall(function()
+			SaveManager:Save("default")
+		end)
+	end
+
 	State.autoRoll = false
 	State.autoBuy = false
 	State.autoUpgrade = false
@@ -1208,6 +1626,10 @@ Library:OnUnload(function()
 	State.autoClaimBattlepass = false
 	State.autoClaimQuests = false
 	State.autoClaimFactionQuests = false
+	State.autoFight = false
+	State.autoJoinTower = false
+	State.autoLuckPotion = false
+	State.autoPotionOnMutationEvents = false
 	State.waitingForBuy = false
 	State.isSpinning = false
 	State.isFusing = false
@@ -1244,6 +1666,6 @@ end)
 local prompt = getRollPrompt()
 Library:Notify({
 	Title = "Roll Anime",
-	Description = if prompt then "Loaded! All automation loops active." else "Loaded! Make sure you are on your plot.",
+	Description = if prompt then "Loaded! Combat, Auto-Roll, Potions & Config ready." else "Loaded! Make sure you are on your plot.",
 	Time = 4,
 })
