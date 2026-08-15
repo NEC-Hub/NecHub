@@ -37,6 +37,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
 local LocalPlayer = Players.LocalPlayer
 
 -- Real-time Game Data & Cost Engine
@@ -48,6 +49,9 @@ local CoopView = CoopViewModule and require(CoopViewModule)
 
 local RecyclerViewModule = ReplicatedStorage:FindFirstChild("Features") and ReplicatedStorage.Features:FindFirstChild("Scrap") and ReplicatedStorage.Features.Scrap:FindFirstChild("RecyclerView")
 local RecyclerView = RecyclerViewModule and require(RecyclerViewModule)
+
+local RebirthBonusModule = ReplicatedStorage:FindFirstChild("Core") and ReplicatedStorage.Core:FindFirstChild("Progression") and ReplicatedStorage.Core.Progression:FindFirstChild("RebirthBonus")
+local RebirthBonus = RebirthBonusModule and require(RebirthBonusModule)
 
 ------------------------------------------------------
 -- Synchronized Remote Queue & Rate-Limiter
@@ -405,12 +409,13 @@ TowerBox:AddToggle("AutoDeclineTowerContinue", {
 })
 
 TowerBox:AddSlider("TowerDelay", {
-    Text = "Tower Check Interval (s)",
-    Default = 2.0,
-    Min = 1.0,
-    Max = 6.0,
+    Text = "Delay Between Tower Runs (s)",
+    Default = 3.0,
+    Min = 0.5,
+    Max = 15.0,
     Rounding = 1,
     Compact = false,
+    Tooltip = "Cooldown time to wait after a tower match finishes before starting the next floor.",
 })
 
 TowerBox:AddDivider()
@@ -541,9 +546,15 @@ RewardsBox:AddButton({
 local RebirthBox = Tabs.Rewards:AddRightGroupbox("Rebirth & Codes")
 
 RebirthBox:AddToggle("AutoRebirth", {
-    Text = "Auto Rebirth",
+    Text = "Auto Rebirth (Surrenders Tower)",
     Default = false,
-    Tooltip = "Rebirths automatically when tower floor requirement is reached",
+    Tooltip = "Instantly surrenders current tower floor and triggers rebirth the moment requirement is met",
+})
+
+RebirthBox:AddToggle("AutoSurrenderOnRebirth", {
+    Text = "Auto Surrender Tower on Rebirth",
+    Default = true,
+    Tooltip = "Exits the active tower floor immediately when the rebirth requirement is satisfied so you can rebirth immediately.",
 })
 
 RebirthBox:AddButton({
@@ -662,6 +673,12 @@ PlayerBox:AddToggle("Noclip", {
     Default = false,
 })
 
+PlayerBox:AddToggle("AntiAFK", {
+    Text = "Anti-AFK (Stay Online)",
+    Default = true,
+    Tooltip = "Prevents Roblox's 20-minute idle disconnect so you can farm continuously without being kicked.",
+})
+
 local defaultWalkSpeed = 16
 local defaultJumpPower = 50
 
@@ -747,6 +764,28 @@ UserInputService.JumpRequest:Connect(function()
         local hum = char and char:FindFirstChildWhichIsA("Humanoid")
         if hum then
             hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end
+end)
+
+-- Anti-AFK System (Signal Interceptor + Periodic Keepalive)
+LocalPlayer.Idled:Connect(function()
+    if Toggles.AntiAFK and Toggles.AntiAFK.Value then
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.zero)
+        end)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(480) -- Every 8 minutes
+        if Toggles.AntiAFK and Toggles.AntiAFK.Value then
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.zero)
+            end)
         end
     end
 end)
@@ -901,12 +940,12 @@ task.spawn(function()
     end
 end)
 
--- 6. Auto Tower Climber & Auto Decline Continue Loop
+-- 6. Auto Tower Climber & Auto Decline Continue
 local towerOfferRemote = RemotesFolder and RemotesFolder:FindFirstChild("TowerContinueOffer")
 if towerOfferRemote and towerOfferRemote:IsA("RemoteEvent") then
     towerOfferRemote.OnClientEvent:Connect(function()
         if Toggles.AutoDeclineTowerContinue and Toggles.AutoDeclineTowerContinue.Value then
-            task.wait(0.05)
+            task.wait(0.2)
             safeFire("TowerContinueDecline")
         end
     end)
@@ -914,30 +953,28 @@ end
 
 task.spawn(function()
     while true do
-        if Toggles.AutoDeclineTowerContinue and Toggles.AutoDeclineTowerContinue.Value then
-            local pGui = LocalPlayer:FindFirstChild("PlayerGui")
-            local tcGui = pGui and pGui:FindFirstChild("TowerContinue")
-            if tcGui and #tcGui:GetChildren() > 0 then
-                safeFire("TowerContinueDecline")
-                for _, btn in ipairs(tcGui:GetDescendants()) do
-                    if btn:IsA("GuiButton") then
-                        pcall(function()
-                            if firesignal then
-                                firesignal(btn.MouseButton1Click)
-                            elseif btn.Activate then
-                                btn:Activate()
-                            end
-                        end)
-                    end
+        if Toggles.AutoClimbTower and Toggles.AutoClimbTower.Value then
+            -- Check if already ready to rebirth before starting another floor
+            local rebirthReady = false
+            if Toggles.AutoRebirth and Toggles.AutoRebirth.Value and DataServiceClient and RebirthBonus then
+                local rebirthData = DataServiceClient:get({"rebirth"}) or {}
+                local towerData = DataServiceClient:get({"tower"}) or {}
+                local count = rebirthData.count or 0
+                local reqFloor = RebirthBonus.requirementFloor(count)
+                local currentFloor = (towerData and tonumber(towerData.best)) or 0
+                if currentFloor >= reqFloor and reqFloor > 0 then
+                    rebirthReady = true
                 end
             end
-        end
 
-        if Toggles.AutoClimbTower and Toggles.AutoClimbTower.Value then
-            safeFire("SetChickenOrder", "tower")
-            safeInvoke("TowerStart")
-            local delayTime = Options.TowerDelay and Options.TowerDelay.Value or 2.0
-            task.wait(delayTime)
+            if not rebirthReady then
+                safeFire("SetChickenOrder", "tower")
+                safeInvoke("TowerStart")
+                local delayTime = Options.TowerDelay and Options.TowerDelay.Value or 3.0
+                task.wait(delayTime)
+            else
+                task.wait(1.0)
+            end
         else
             task.wait(0.5)
         end
@@ -978,11 +1015,29 @@ task.spawn(function()
                 safeInvoke("PassClaim", tier, "free")
             end
         end
-        if Toggles.AutoRebirth and Toggles.AutoRebirth.Value then
-            safeInvoke("Rebirth")
+
+        -- Instant Auto Rebirth with Tower Surrender
+        if Toggles.AutoRebirth and Toggles.AutoRebirth.Value and DataServiceClient and RebirthBonus then
+            local rebirthData = DataServiceClient:get({"rebirth"}) or {}
+            local towerData = DataServiceClient:get({"tower"}) or {}
+            local count = rebirthData.count or 0
+            local reqFloor = RebirthBonus.requirementFloor(count)
+            local currentFloor = (towerData and tonumber(towerData.best)) or 0
+
+            if currentFloor >= reqFloor and reqFloor > 0 then
+                if isTowerMatchActive() and (Toggles.AutoSurrenderOnRebirth == nil or Toggles.AutoSurrenderOnRebirth.Value) then
+                    safeInvoke("TowerSurrender")
+                end
+                safeFire("SetChickenOrder", "coop")
+                task.wait(0.2)
+                local res = safeInvoke("Rebirth")
+                if res and res.ok then
+                    Library:Notify({ Title = "NeColman Hub", Description = `Rebirthed to Rebirth {count + 1}!`, Time = 3 })
+                end
+            end
         end
 
-        task.wait(5.0)
+        task.wait(1.5)
     end
 end)
 
